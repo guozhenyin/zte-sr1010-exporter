@@ -1,0 +1,19 @@
+services:
+  zte-exporter:
+    build: .
+    image: zte-sr1010-exporter:0.2.2
+    container_name: zte-sr1010-exporter
+    restart: unless-stopped
+    environment:
+      ZTE_URL: "http://192.168.5.1"
+      # 页面只显示密码，但接口固定传 Username=admin
+      ZTE_USERNAME: "admin"
+      ZTE_PASSWORD: "CHANGE_ME"
+      LISTEN: ":9100"
+      DEBUG: "true"
+      TIMEOUT: "8"
+      # 可选：关闭体量较大的采集项以降低抓取耗时
+      DISABLE_CLIENTS: "false"
+      DISABLE_ARP: "false"
+    ports:
+      - "9100:9100"
