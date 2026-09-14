@@ -45,16 +45,16 @@ docker compose up -d --build
 curl -s http://127.0.0.1:9100/metrics
 ```
 
-> Compose 显式设置了 `LISTEN=:9100` 并映射 `9100:9100`。若直接 `docker run` 且不传 `LISTEN`，容器内监听的是默认的 `:9100`，需映射 `9100` 或加 `-e LISTEN=:9100`。
+> Compose 显式设置了 `LISTEN=:9100` 并映射 `9100:9100`。若直接 `docker run` 且不传 `LISTEN`，容器内监听的是默认的 `:9101`，需映射 `9101` 或加 `-e LISTEN=:9100`。
 
 ## 配置项
 
 | 命令行 | 环境变量 | 默认值 | 说明 |
 |---|---|---|---|
-| `--url` | `ZTE_URL` | `http://192.168.5.1` | 路由器管理地址 |
+| `--url` | `ZTE_URL` | `http://192.168.10.1` | 路由器管理地址 |
 | `--username` | `ZTE_USERNAME` | `admin` | 登录用户名（SR1010 固定为 admin） |
 | `--password` | `ZTE_PASSWORD` | – | 登录密码，**必填**，为空则进程退出 |
-| `--listen` | `LISTEN` | `:9100` | 监听地址 |
+| `--listen` | `LISTEN` | `:9101` | 监听地址 |
 | `--timeout` | `TIMEOUT` | `8` | 单个 HTTP 请求超时（秒） |
 | `--debug` | `DEBUG` | `false` | 详细日志（含 URL、token、响应片段） |
 | `--disable-clients` | `DISABLE_CLIENTS` | `false` | 跳过 LAN 终端明细表（体积最大的一项） |
@@ -306,6 +306,12 @@ Grafana → Dashboards → Import → 上传 `grafana-dashboard-sr1010.json`。�
 ## 注意事项与限制
 
 - **单位未换算的指标**：`zte_eth_port_speed_code`、`zte_eth_port_max_speed_code`、`zte_client_upload_rate`、`zte_client_download_rate` 按固件原值透传，固件未公开枚举含义，请以本机实测为准。
+- **代理导致请求超时**：路由器是局域网设备，请求必须直连。若容器内存在 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`（Docker Desktop 与部分宿主机代理配置会自动注入），Go 的默认 Transport 会把发往 `192.168.x.x` 的请求交给上游代理，日志表现为：
+  ```text
+  proxyconnect tcp: dial tcp 192.168.10.50:10808: i/o timeout
+  login failed: login_entry: Get "http://192.168.10.1/?...": context deadline exceeded
+  ```
+  本程序已在 `pkg/client/zte.go` 中固定 `Transport.Proxy = nil` 并设置了拨号/响应头超时，局域网请求始终直连，不再受代理环境影响；启动时若检测到代理变量会打印 `[warn] ... is set but ignored`。`docker-compose.yml` 另附 `NO_PROXY` 作为双保险。
 - **登录失败排查**：`DEBUG=true` 查看 token 响应与 POST 表单；若固件改版，需同步调整 `pkg/client/zte.go`。
 - **会话被抢占**：路由器通常只允许一个管理会话，长期开着的 Web 页面会把 Exporter 挤下线，此时会返回 `e_exceed_max_user_preempt` 并进入 65 秒退避。
 - **抓取失败只影响 `zte_up`**：子接口失败不会中断整轮抓取，日志中可见 `GetXxx failed`。

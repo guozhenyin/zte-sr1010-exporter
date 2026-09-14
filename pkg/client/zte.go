@@ -3,12 +3,15 @@ package client
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -29,12 +32,14 @@ type ZTEClient struct {
 	logged       bool
 	lastLoginAt  time.Time
 	lastFailAt   time.Time
-	loginBackoff time.Duration // avoid lockout
+	loginBackoff time.Duration // current backoff window (grows on repeated failures)
+	failStreak   int           // consecutive login failures
 	sessionToken string        // reused for POST endpoints (e.g. ARP table)
 }
 
 func New(baseURL, user, pass string, timeout time.Duration, debug bool) *ZTEClient {
 	jar, _ := cookiejar.New(nil)
+	warnIgnoredProxyEnv()
 	return &ZTEClient{
 		BaseURL:      strings.TrimRight(baseURL, "/"),
 		Username:     user,
@@ -43,12 +48,49 @@ func New(baseURL, user, pass string, timeout time.Duration, debug bool) *ZTEClie
 		Debug:        debug,
 		loginBackoff: 65 * time.Second, // router locks ~60s after failed attempts
 		client: &http.Client{
-			Jar:     jar,
-			Timeout: timeout,
+			Transport: newRouterTransport(timeout),
+			Jar:       jar,
+			Timeout:   timeout,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
 		},
+	}
+}
+
+// newRouterTransport builds a transport that NEVER uses an HTTP proxy.
+//
+// The target is always a device on the local LAN (e.g. http://192.168.10.1).
+// Go's http.DefaultTransport honours HTTP_PROXY / HTTPS_PROXY / ALL_PROXY via
+// http.ProxyFromEnvironment, and Docker Desktop (or a host-level proxy) injects
+// those variables into containers. That makes every request to the router get
+// sent to the upstream proxy instead, which fails with:
+//
+//	proxyconnect tcp: dial tcp 192.168.10.50:10808: i/o timeout
+//
+// Setting Proxy to nil keeps LAN traffic direct regardless of the environment.
+func newRouterTransport(timeout time.Duration) *http.Transport {
+	return &http.Transport{
+		Proxy: nil, // ignore HTTP_PROXY/HTTPS_PROXY/ALL_PROXY entirely
+		DialContext: (&net.Dialer{
+			Timeout:   timeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          8,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   timeout,
+		ResponseHeaderTimeout: timeout,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+}
+
+// warnIgnoredProxyEnv logs proxy variables that are present but intentionally
+// ignored, so "i/o timeout" reports can be traced back to the environment.
+func warnIgnoredProxyEnv() {
+	for _, k := range []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"} {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			log.Printf("[warn] %s=%s is set but ignored: router requests always go direct", k, v)
+		}
 	}
 }
 
@@ -72,49 +114,99 @@ func (c *ZTEClient) InvalidateSession() {
 //     → {"_sessionToken":"...","logintoken":"11880034"}
 //  3. POST /?_type=loginData&_tag=login_entry
 //     Password = SHA256(password + logintoken)
+//
+// Success is an EMPTY loginErrType, i.e.
+//
+//	{"loginErrType":"","login_need_refresh":true}
+//
+// That answer carries NO session token, so "sess_token" must never be part of
+// the success test (doing so made every login look like a failure).
+//
+// When another management session is active the router answers
+// e_exceed_max_user_preempt together with a fresh session token; one immediate
+// retry then completes the preemption, exactly like the web UI does.
 func (c *ZTEClient) Login() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// respect backoff after lock / consecutive failures
-	if !c.lastFailAt.IsZero() && time.Since(c.lastFailAt) < c.loginBackoff {
-		remain := c.loginBackoff - time.Since(c.lastFailAt)
+	if remain := c.backoffRemain(); remain > 0 {
 		return fmt.Errorf("login backoff, wait %s", remain.Round(time.Second))
 	}
 
+	errType, err := c.loginOnce()
+	if err != nil {
+		c.markLoginFailed(errType)
+		return err
+	}
+
+	if errType == "e_exceed_max_user_preempt" {
+		c.debugf("login preempted by another session, retrying once")
+		errType, err = c.loginOnce()
+		if err != nil {
+			c.markLoginFailed(errType)
+			return err
+		}
+	}
+
+	if errType != "" {
+		c.markLoginFailed(errType)
+		if errType == "e_invalid_user_pwd" {
+			return fmt.Errorf("login failed (bad password/token)")
+		}
+		return fmt.Errorf("login rejected: %s", errType)
+	}
+
+	c.logged = true
+	c.lastLoginAt = time.Now()
+	c.lastFailAt = time.Time{}
+	c.failStreak = 0
+	c.loginBackoff = 65 * time.Second
+	c.debugf("login succeeded")
+
+	// 登录后访问一次首页，让路由器完成 session 绑定
+	homeTS := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	homeURL := fmt.Sprintf("%s/?_type=vueData&_tag=vue_home_device_data_no_update_sess&IF_OP=refresh&_=%s", c.BaseURL, homeTS)
+	homeBody, homeErr := c.doGet(homeURL)
+	if homeErr == nil {
+		c.debugf("post-login home probe: len=%d, hasBasicInfo=%v", len(homeBody), HasBasicInfo(homeBody))
+	} else {
+		c.debugf("post-login home probe failed: %v", homeErr)
+	}
+
+	return nil
+}
+
+// loginOnce runs one complete handshake round and returns the router verdict
+// ("" on success, "unexpected_response" when the answer cannot be parsed).
+func (c *ZTEClient) loginOnce() (string, error) {
 	ts := strconv.FormatInt(time.Now().UnixMilli(), 10)
 
 	entryURL := fmt.Sprintf("%s/?_type=loginData&_tag=login_entry&_=%s", c.BaseURL, ts)
 	body1, err := c.doGet(entryURL)
 	if err != nil {
-		return fmt.Errorf("login_entry: %w", err)
+		return "", fmt.Errorf("login_entry: %w", err)
 	}
 	c.debugf("login_entry response: %s", truncate(body1, 200))
 
 	tokenURL := fmt.Sprintf("%s/?_type=loginsceneData&_tag=login_token_json", c.BaseURL)
 	body2, err := c.doGet(tokenURL)
 	if err != nil {
-		return fmt.Errorf("login_token_json: %w", err)
+		return "", fmt.Errorf("login_token_json: %w", err)
 	}
 	c.debugf("login_token_json: %s", body2)
 
 	loginToken := extract(body2, `"logintoken"\s*:\s*"([^"]+)"`)
-	sessionToken := extract(body2, `"_sessionToken"\s*:\s*"([^"]+)"`)
-	if sessionToken == "" {
-		sessionToken = extract(body2, `"_sessionTOKEN"\s*:\s*"([^"]+)"`)
-	}
-	if sessionToken == "" {
-		sessionToken = extract(body1, `"sess_token"\s*:\s*"([^"]+)"`)
-	}
-	if sessionToken == "" {
-		sessionToken = extract(body1, `"_sessionToken"\s*:\s*"([^"]+)"`)
-	}
+	sessionToken := firstNonEmpty(
+		extract(body2, `"_sessionToken"\s*:\s*"([^"]+)"`),
+		extract(body2, `"_sessionTOKEN"\s*:\s*"([^"]+)"`),
+		extract(body1, `"sess_token"\s*:\s*"([^"]+)"`),
+		extract(body1, `"_sessionToken"\s*:\s*"([^"]+)"`),
+	)
 	c.sessionToken = sessionToken
 
 	c.debugf("extracted logintoken=%s  _sessionToken=%s", loginToken, sessionToken)
 	if loginToken == "" {
-		c.lastFailAt = time.Now()
-		return fmt.Errorf("failed to extract logintoken from: %s", truncate(body2, 200))
+		return "", fmt.Errorf("failed to extract logintoken from: %s", truncate(body2, 200))
 	}
 
 	hashed := sha256Hex(c.Password + loginToken)
@@ -138,52 +230,74 @@ func (c *ZTEClient) Login() error {
 	postURL := fmt.Sprintf("%s/?_type=loginData&_tag=login_entry", c.BaseURL)
 	respBody, err := c.doPostForm(postURL, form)
 	if err != nil {
-		return fmt.Errorf("login POST: %w", err)
+		return "", fmt.Errorf("login POST: %w", err)
 	}
 	c.debugf("login POST response: %s", respBody)
 
-	// ---- 明确的错误判断（必须在"成功判断"之前） ----
+	return parseLoginErrType(respBody), nil
+}
 
-	if strings.Contains(respBody, "e_invalid_user_pwd") || strings.Contains(respBody, "用户名或密码") {
-		c.logged = false
-		c.lastFailAt = time.Now()
-		return fmt.Errorf("login failed (bad password/token): %s", truncate(respBody, 200))
+// parseLoginErrType reads the verdict from a login POST response:
+//
+//	{"loginErrType":"","login_need_refresh":true}                                    -> success
+//	{"login_need_refresh":true,"sess_token":"...","loginErrType":"e_exceed..."}      -> preempted
+func parseLoginErrType(body string) string {
+	var res struct {
+		// Pointer: a JSON answer without the field must NOT be mistaken for a
+		// successful login (empty string is the success value).
+		ErrType *string `json:"loginErrType"`
 	}
-	if strings.Contains(respBody, "e_login_locked") {
-		c.logged = false
-		c.lastFailAt = time.Now()
-		return fmt.Errorf("login locked: %s", truncate(respBody, 200))
+	if err := json.Unmarshal([]byte(body), &res); err == nil && res.ErrType != nil {
+		return *res.ErrType
 	}
-	// ↓↓↓ 关键修复：e_exceed_max_user_preempt 必须视为登录失败
-	if strings.Contains(respBody, "e_exceed_max_user_preempt") {
-		c.logged = false
-		c.lastFailAt = time.Now()
-		return fmt.Errorf("login preempted by another session (e_exceed_max_user_preempt): %s", truncate(respBody, 200))
-	}
-
-	// ---- 只有 loginErrType 为空 + 有 sess_token 才算成功 ----
-	if strings.Contains(respBody, `"loginErrType":""`) && strings.Contains(respBody, "sess_token") {
-		c.logged = true
-		c.lastLoginAt = time.Now()
-		c.lastFailAt = time.Time{}
-		c.debugf("login succeeded")
-
-		// 登录后访问一次首页，让路由器完成 session 绑定
-		homeTS := strconv.FormatInt(time.Now().UnixMilli(), 10)
-		homeURL := fmt.Sprintf("%s/?_type=vueData&_tag=vue_home_device_data_no_update_sess&IF_OP=refresh&_=%s", c.BaseURL, homeTS)
-		homeBody, homeErr := c.doGet(homeURL)
-		if homeErr == nil {
-			c.debugf("post-login home probe: len=%d, hasBasicInfo=%v", len(homeBody), HasBasicInfo(homeBody))
-		} else {
-			c.debugf("post-login home probe failed: %v", homeErr)
+	// Non-JSON answer (login page or HTML error page).
+	for _, e := range []string{"e_invalid_user_pwd", "e_login_locked", "e_exceed_max_user_preempt"} {
+		if strings.Contains(body, e) {
+			return e
 		}
-
-		return nil
 	}
+	if strings.Contains(body, `"loginErrType":""`) {
+		return ""
+	}
+	return "unexpected_response"
+}
 
+// backoffRemain reports how long the caller must still wait before the next
+// login attempt is permitted.
+func (c *ZTEClient) backoffRemain() time.Duration {
+	if c.lastFailAt.IsZero() {
+		return 0
+	}
+	if remain := c.loginBackoff - time.Since(c.lastFailAt); remain > 0 {
+		return remain
+	}
+	return 0
+}
+
+// markLoginFailed records a failed attempt and widens the backoff window, so a
+// permanently broken credential/config cannot turn into a retry storm.
+func (c *ZTEClient) markLoginFailed(errType string) {
 	c.logged = false
 	c.lastFailAt = time.Now()
-	return fmt.Errorf("login unexpected response: %s", truncate(respBody, 200))
+	c.failStreak++
+	if errType != "" {
+		c.debugf("login attempt failed: %s (streak=%d)", errType, c.failStreak)
+	}
+	if c.failStreak > 1 {
+		c.loginBackoff *= 2
+		if c.loginBackoff > 10*time.Minute {
+			c.loginBackoff = 10 * time.Minute
+		}
+	}
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // EnsureLogin re-logins if needed.

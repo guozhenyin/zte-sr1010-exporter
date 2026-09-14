@@ -1,6 +1,7 @@
 # Build stage
 FROM golang:1.22-alpine AS builder
 WORKDIR /src
+ENV GOPROXY=https://goproxy.cn,direct
 COPY go.mod go.sum* ./
 RUN go mod download
 COPY . .

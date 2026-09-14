@@ -45,6 +45,9 @@ type ZTEExporter struct {
 	x *extraMetrics
 
 	mu sync.Mutex
+
+	// lastLoginErr de-duplicates repeated login-failure logs across scrapes.
+	lastLoginErr string
 }
 
 // New builds the exporter. All metric descriptors are registered through
@@ -97,8 +100,12 @@ func (e *ZTEExporter) Collect(ch chan<- prometheus.Metric) {
 	}()
 
 	if err := e.client.EnsureLogin(); err != nil {
-		log.Printf("login failed: %v", err)
+		// No usable session: stop here instead of firing every data request
+		// and letting the login backoff flood the log on each scrape.
+		e.logLoginErr(err)
+		return
 	}
+	e.clearLoginErr()
 
 	body, err := e.client.GetHomeDeviceData()
 	if err != nil {
@@ -107,11 +114,11 @@ func (e *ZTEExporter) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	// Session-expired signature: no WANUpRate / OBJ_HOME_BASICINFO_ID.
+	// GetHomeDeviceData already invalidated the session in that case.
 	if !client.HasBasicInfo(body) {
 		log.Printf("session appears expired (no WANUpRate, len=%d), re-login...", len(body))
-		e.client.InvalidateSession()
 		if err := e.client.Login(); err != nil {
-			log.Printf("re-login failed: %v", err)
+			e.logLoginErr(err)
 			return
 		}
 		body, err = e.client.GetHomeDeviceData()
@@ -191,6 +198,27 @@ func (e *ZTEExporter) collectHome(ch chan<- prometheus.Metric, body string) {
 		client.ExtractPara(body, "DevMac"),
 		client.ExtractPara(body, "Mode"),
 	)
+}
+
+// ---------------------------------------------------------------------------
+// login failure log de-duplication
+// ---------------------------------------------------------------------------
+
+// logLoginErr prints a login error only when it differs from the previous one,
+// so an unreachable or locked router does not emit an identical line on every
+// single scrape.
+func (e *ZTEExporter) logLoginErr(err error) {
+	msg := err.Error()
+	if msg == e.lastLoginErr {
+		return
+	}
+	e.lastLoginErr = msg
+	log.Printf("login failed: %v", err)
+}
+
+// clearLoginErr resets the de-duplication state after a successful login.
+func (e *ZTEExporter) clearLoginErr() {
+	e.lastLoginErr = ""
 }
 
 // ---------------------------------------------------------------------------
